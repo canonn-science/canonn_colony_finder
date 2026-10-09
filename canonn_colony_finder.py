@@ -49,7 +49,6 @@ GRID_SIZE = RADIUS_LY  # one grid cell = one radius, so a 1-cell neighborhood co
 RARE_SUBTYPES = {
     "High metal content world",
     "Rocky body",
-    "K (Yellow-Orange) Star",
     "Metal-rich body",
     "Water world",
     "Gas giant with water-based life",
@@ -143,17 +142,30 @@ def load_candidates():
 # ---------------------------------------------------------------- body classification
 
 GENUS_PREFIX = "$Codex_Ent_"
-GENUS_SUFFIX = "_Genus_Name;"
+# Raw codex genus string for Bark Mounds - checked before cleaning, see interesting_bodies().
+CONE_GENUS = "$Codex_Ent_Cone_Name;"
+# Most genus codex names end in "_Genus_Name;" (e.g. "Bacterial"), but a few -
+# Brain Trees among them - skip the "_Genus_" segment and just end in "_Name;".
+GENUS_SUFFIXES = ("_Genus_Name;", "_Name;")
+
+# Codex internal names that don't read as an English genus name even once the
+# prefix/suffix are stripped (e.g. "Brancae" -> "Brain Trees").
+GENUS_NAME_OVERRIDES = {
+    "Brancae": "Brain Trees",
+    "Cone": "Bark Mounds",
+}
 
 
 def clean_genus_name(raw):
-    """"$Codex_Ent_Bacterial_Genus_Name;" -> "Bacterial"."""
+    """"$Codex_Ent_Bacterial_Genus_Name;" -> "Bacterial"; "$Codex_Ent_Brancae_Name;" -> "Brain Trees"."""
     name = raw or ""
     if name.startswith(GENUS_PREFIX):
         name = name[len(GENUS_PREFIX):]
-    if name.endswith(GENUS_SUFFIX):
-        name = name[: -len(GENUS_SUFFIX)]
-    return name
+    for suffix in GENUS_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return GENUS_NAME_OVERRIDES.get(name, name)
 
 
 def normalize_terraforming(raw):
@@ -175,12 +187,6 @@ def interesting_bodies(bodies):
         body_type = body.get("type")
         is_gas_giant = body_type == "Planet" and "gas giant" in sub_type.lower()
         rare = sub_type in RARE_SUBTYPES or is_gas_giant
-        if not rare and (
-            body.get("isLandable")
-            and body.get("rings")
-            and (body.get("atmosphereType") or "No atmosphere") != "No atmosphere"
-        ):
-            rare = True
         if rare:
             found.append({
                 "name": body.get("name"),
@@ -191,6 +197,10 @@ def interesting_bodies(bodies):
 
         genuses = (body.get("signals") or {}).get("genuses") or []
         for genus in genuses:
+            # Bark Mounds (Cone) are a volcanic-activity signal - without an
+            # actual volcanism type on the body, this genus entry is noise.
+            if genus == CONE_GENUS and not has_volcanism(body):
+                continue
             found.append({
                 "name": body.get("name"),
                 "subType": clean_genus_name(genus),
@@ -200,10 +210,24 @@ def interesting_bodies(bodies):
     return found
 
 
+def has_volcanism(body):
+    volcanism = (body.get("volcanismType") or "").strip()
+    return bool(volcanism) and volcanism.lower() != "no volcanism"
+
+
+def faction_name(value):
+    """A faction field's name, whether it's a plain string or an object (dump
+    formats vary - stations use a plain string, but the system-level
+    controllingFaction field has been observed as a {"name": ...} object)."""
+    if isinstance(value, dict):
+        return value.get("name")
+    return value
+
+
 def controlled_stations(stations):
     names = []
     for st in stations or []:
-        if st.get("controllingFaction") in TARGET_FACTIONS:
+        if faction_name(st.get("controllingFaction")) in TARGET_FACTIONS:
             names.append(st.get("name"))
     return names
 
@@ -237,6 +261,29 @@ def nearest_in_grid(grid, x, y, z):
                     if dist <= RADIUS_LY and (best_dist is None or dist < best_dist):
                         best, best_dist = loc, dist
     return best, best_dist
+
+
+def nearest_anchor(grid, x, y, z):
+    """Like nearest_in_grid, but for picking a system's home anchor specifically:
+    an anchor whose SYSTEM (not just a station in it) is Canonn/CDSR-controlled
+    always wins over one where Canonn/CDSR only controls a station in a system
+    otherwise controlled by someone else (or no one) - the former is a much
+    stronger signal that the system is actually "home". Distance is only the
+    tiebreaker within the same preference tier."""
+    cx, cy, cz = cell_key(x, y, z)
+    best, best_rank = None, None
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                for loc in grid.get((cx + dx, cy + dy, cz + dz), []):
+                    c = loc["coords"]
+                    dist = math.sqrt((x - c["x"]) ** 2 + (y - c["y"]) ** 2 + (z - c["z"]) ** 2)
+                    if dist > RADIUS_LY:
+                        continue
+                    rank = (0 if loc.get("controls_system") else 1, dist)
+                    if best_rank is None or rank < best_rank:
+                        best, best_rank = loc, rank
+    return (best, best_rank[1]) if best is not None else (None, None)
 
 
 def scan_galaxy(candidates, galaxy_file):
@@ -316,6 +363,7 @@ def scan_galaxy(candidates, galaxy_file):
                         "name": system.get("name"),
                         "coords": coords,
                         "stations": sorted(set(names)),
+                        "controls_system": faction_name(system.get("controllingFaction")) in TARGET_FACTIONS,
                     })
 
             # --- interesting-pool check ---
@@ -379,7 +427,7 @@ def join_and_write(anchors, interesting_pool):
 
     for system in interesting_pool:
         c = system["coords"]
-        anchor, distance = nearest_in_grid(grid, c["x"], c["y"], c["z"])
+        anchor, distance = nearest_anchor(grid, c["x"], c["y"], c["z"])
         if anchor is None:
             continue
         results.append({

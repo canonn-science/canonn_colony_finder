@@ -380,6 +380,109 @@
     els.lastPage.disabled = state.page >= pages;
   }
 
+  // The generator cleans genus codex names (e.g. "$Codex_Ent_Bacterial_Genus_Name;"
+  // -> "Bacterial") before writing the data file, but older data files may still
+  // carry a leftover, not-fully-stripped suffix (e.g. "Sphere_Name;") if they were
+  // generated before a fix landed here. Cleaning again on load is a safety net so
+  // the site always displays the current translation without needing a data rerun.
+  const GENUS_CODEX_PREFIX = "$Codex_Ent_";
+  const GENUS_CODEX_SUFFIXES = ["_Genus_Name;", "_Name;"];
+  const GENUS_NAME_OVERRIDES = {
+    Sphere: "Anemone",
+    Brancae: "Brain Trees",
+    Cone: "Bark Mounds",
+  };
+
+  function cleanSubType(subType) {
+    let name = subType || "";
+    if (name.startsWith(GENUS_CODEX_PREFIX)) {
+      name = name.slice(GENUS_CODEX_PREFIX.length);
+    }
+    for (const suffix of GENUS_CODEX_SUFFIXES) {
+      if (name.endsWith(suffix)) {
+        name = name.slice(0, -suffix.length);
+        break;
+      }
+    }
+    return GENUS_NAME_OVERRIDES[name] || name;
+  }
+
+  // The curated set of subtypes the generator (canonn_colony_finder.py) treats as
+  // genuinely interesting, mirrored here so already-generated data files that
+  // predate a classification fix (e.g. still carrying a since-removed subtype
+  // like an ordinary "K (Yellow-Orange) Star", or one that only slipped in via a
+  // since-removed rule, like "Icy body" via the old landable+rings+atmosphere
+  // special case) don't display stale noise. Not load-bearing once the data file
+  // is regenerated with the current generator - just a safety net until then.
+  const ALLOWED_SUBTYPES = new Set([
+    "High metal content world",
+    "Rocky body",
+    "Metal-rich body",
+    "Water world",
+    "Gas giant with water-based life",
+    "Neutron Star",
+    "T Tauri Star",
+    "Gas giant with ammonia-based life",
+    "Ammonia world",
+    "Earth-like world",
+    "Black Hole",
+    "Water giant",
+    "Helium-rich gas giant",
+    "M (Red giant) Star",
+    "White Dwarf (DC) Star",
+    "Herbig Ae/Be Star",
+    "White Dwarf (DA) Star",
+    "White Dwarf (DAB) Star",
+    "K (Yellow-Orange giant) Star",
+    "Wolf-Rayet O Star",
+    "S-type Star",
+    "MS-type Star",
+    "White Dwarf (DB) Star",
+    "CN Star",
+    "A (Blue-White super giant) Star",
+    "White Dwarf (DCV) Star",
+    "B (Blue-White super giant) Star",
+    "White Dwarf (DAV) Star",
+    "Wolf-Rayet C Star",
+    "Wolf-Rayet N Star",
+    "Wolf-Rayet NC Star",
+    "F (White super giant) Star",
+    "G (White-Yellow super giant) Star",
+    "White Dwarf (DBV) Star",
+    "M (Red super giant) Star",
+    "CJ Star",
+    "White Dwarf (DAZ) Star",
+    "White Dwarf (DBZ) Star",
+    "C Star",
+    "Wolf-Rayet Star",
+    "White Dwarf (DQ) Star",
+    "Helium gas giant",
+    "White Dwarf (D) Star",
+    // Biological signal genuses (cleaned display names, including this file's overrides).
+    "Aleoids",
+    "Bacterial",
+    "Cactoid",
+    "Clypeus",
+    "Conchas",
+    "Electricae",
+    "Fonticulus",
+    "Fumerolas",
+    "Fungoids",
+    "Osseus",
+    "Recepta",
+    "Shrubs",
+    "Stratum",
+    "Tubus",
+    "Tussocks",
+    "Brain Trees",
+    "Bark Mounds",
+    "Anemone",
+  ]);
+
+  function isAllowedSubType(subType) {
+    return ALLOWED_SUBTYPES.has(subType) || subType.toLowerCase().includes("gas giant");
+  }
+
   const TERRAFORM_LABELS = {
     terraformed: "Terraformed",
     terraforming: "Terraforming",
@@ -629,6 +732,9 @@
       const data = await res.json();
       for (const row of data) {
         row.architect = architectMap.get(row.homeSystem) || "";
+        row.interestingBodies = (row.interestingBodies || [])
+          .map((body) => ({ ...body, subType: cleanSubType(body.subType) }))
+          .filter((body) => isAllowedSubType(body.subType));
       }
       state.all = data;
       populateDropdowns(data);
