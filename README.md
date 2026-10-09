@@ -14,6 +14,13 @@ target system.
 python3 canonn_colony_finder.py /path/to/galaxy.json.gz
 ```
 
+- Optional `--codex DIR`: a directory of Canonn codex dumps named
+  `{entryid}.csv` (no header; `SystemName,x,y,z,entryid,id64,region1,region2`).
+  Entry names come from
+  `https://us-central1-canonn-api-236217.cloudfunctions.net/query/codex/ref`,
+  limited to the `Anomaly`, `Biology`, `Cloud` and `Tourist` HUD categories.
+  A system with such a codex entry counts as interesting, and the entry's
+  English name appears in `interestingBodies` with `"codex": true`.
 - `galaxy.json.gz` is the full Spansh galaxy dump
   (https://downloads.spansh.co.uk/galaxy.json.gz). It is **not** bundled here
   — it's currently ~117 GB, so point the script at wherever you've downloaded

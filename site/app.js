@@ -733,8 +733,8 @@
       for (const row of data) {
         row.architect = architectMap.get(row.homeSystem) || "";
         row.interestingBodies = (row.interestingBodies || [])
-          .map((body) => ({ ...body, subType: cleanSubType(body.subType) }))
-          .filter((body) => isAllowedSubType(body.subType));
+          .map((body) => (body.codex ? body : { ...body, subType: cleanSubType(body.subType) }))
+          .filter((body) => body.codex || isAllowedSubType(body.subType));
       }
       state.all = data;
       populateDropdowns(data);

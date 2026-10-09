@@ -21,11 +21,17 @@ only the *confirmed* anchors (a subset of candidates) is a cheap in-memory
 step afterwards - not a second file pass.
 
 Usage:
-    python3 canonn_colony_finder.py /path/to/galaxy.json.gz
+    python3 canonn_colony_finder.py /path/to/galaxy.json.gz [--codex /path/to/dumps]
+
+With --codex, a directory of Canonn codex dump files ({entryid}.csv, no header,
+columns SystemName,x,y,z,entryid,id64,region1,region2) is also searched: a
+system that has a codex entry in the Anomaly / Biology / Cloud / Tourist HUD
+categories counts as "interesting" and lists that entry's English name.
 
 Output: site/data/canonn_colony_targets.json (written next to this script)
 """
 import argparse
+import csv
 import gzip
 import json
 import math
@@ -39,6 +45,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FACTIONS_URL = "https://downloads.spansh.co.uk/factions.json.gz"
 FACTIONS_FILE = os.path.join(SCRIPT_DIR, "factions.json.gz")
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "site", "data", "canonn_colony_targets.json")
+
+CODEX_REF_URL = "https://us-central1-canonn-api-236217.cloudfunctions.net/query/codex/ref"
+CODEX_HUD_CATEGORIES = {"Anomaly", "Biology", "Cloud", "Tourist"}
 
 TARGET_FACTIONS = {"Canonn", "Canonn Deep Space Research"}
 
@@ -232,6 +241,82 @@ def controlled_stations(stations):
     return names
 
 
+# ---------------------------------------------------------------- codex dumps
+
+def load_codex_ref():
+    """entryid (str) -> English name, for entries in CODEX_HUD_CATEGORIES only."""
+    print(f"Fetching codex reference from {CODEX_REF_URL} ...")
+    req = urllib.request.Request(CODEX_REF_URL, headers={"User-Agent": "canonn-colony-finder"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.load(resp)
+    entries = data.values() if isinstance(data, dict) else data
+    ref = {}
+    for entry in entries:
+        if entry.get("hud_category") not in CODEX_HUD_CATEGORIES:
+            continue
+        name = entry.get("english_name")
+        if name and entry.get("entryid") is not None:
+            ref[str(entry["entryid"])] = name
+    return ref
+
+
+def load_codex_dumps(codex_dir, candidate_grid):
+    """Read {entryid}.csv files for the wanted entryids. Returns
+    {id64: {(entryid, english_name), ...}} and {lowercase system name: {...}}
+    (the name index is a fallback for rows with no id64).
+
+    Rows are discarded unless they lie within RADIUS_LY of some candidate, using
+    the x,y,z columns, so memory stays bounded however big the dumps are."""
+    ref = load_codex_ref()
+    by_id64, by_name = {}, {}
+    files = rows = kept = 0
+    near = {}  # entryid -> set of system keys near a candidate
+    for entryid, english in ref.items():
+        path = os.path.join(codex_dir, f"{entryid}.csv")
+        if not os.path.isfile(path):
+            continue
+        files += 1
+        with open(path, newline="", encoding="utf-8", errors="replace") as f:
+            for row in csv.reader(f):
+                if len(row) < 6:
+                    continue
+                rows += 1
+                try:
+                    x, y, z = float(row[1]), float(row[2]), float(row[3])
+                except ValueError:
+                    continue
+                if nearest_in_grid(candidate_grid, x, y, z)[0] is None:
+                    continue
+                kept += 1
+                id64 = row[5].strip()
+                if id64.isdigit():
+                    by_id64.setdefault(int(id64), set()).add((entryid, english))
+                    near.setdefault(entryid, set()).add(int(id64))
+                else:
+                    by_name.setdefault(row[0].strip().lower(), set()).add((entryid, english))
+                    near.setdefault(entryid, set()).add(row[0].strip().lower())
+    print(f"Codex: read {rows:,} rows from {files} of {len(ref)} wanted entry files; "
+          f"{kept:,} near a candidate.")
+    print("Codex entries with systems near a candidate:")
+    for entryid, systems in sorted(near.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {entryid:>8} {ref[entryid]}: {len(systems):,} systems")
+    return by_id64, by_name
+
+
+def codex_bodies(system_name, id64, codex):
+    """Codex hits for a system, shaped like interestingBodies entries."""
+    by_id64, by_name = codex
+    hits = set(by_id64.get(id64, ())) | set(by_name.get((system_name or "").lower(), ()))
+    return [{
+        "name": system_name,
+        "subType": name,
+        "ringed": False,
+        "terraform": "not",
+        "codex": True,
+        "entryid": entryid,
+    } for entryid, name in sorted(hits)]
+
+
 # ---------------------------------------------------------------- step 2: single pass
 
 def cell_key(x, y, z):
@@ -286,7 +371,7 @@ def nearest_anchor(grid, x, y, z):
     return (best, best_rank[1]) if best is not None else (None, None)
 
 
-def scan_galaxy(candidates, galaxy_file):
+def scan_galaxy(candidates, galaxy_file, codex_dir=None):
     """candidates: dict of id64 -> {"name": ..., "coords": {...}}."""
     candidate_ids = set(candidates.keys())
     # Pre-built from factions.json.gz coords - lets us reject systems far from
@@ -296,6 +381,8 @@ def scan_galaxy(candidates, galaxy_file):
     candidate_grid = build_grid(
         {"coords": c["coords"]} for c in candidates.values() if c.get("coords")
     )
+
+    codex = load_codex_dumps(codex_dir, candidate_grid) if codex_dir else ({}, {})
 
     anchors = []
     found_candidate_ids = set()
@@ -391,7 +478,7 @@ def scan_galaxy(candidates, galaxy_file):
 
             bodies = system.get("bodies") or []
             body_count = system.get("bodyCount") or len(bodies)
-            rare_bodies = interesting_bodies(bodies)
+            rare_bodies = interesting_bodies(bodies) + codex_bodies(system.get("name"), id64, codex)
 
             if body_count <= MIN_BODY_COUNT and not rare_bodies:
                 continue
@@ -448,6 +535,16 @@ def join_and_write(anchors, interesting_pool):
 
     print(f"{len(results)} colony target systems written to {OUTPUT_FILE}.")
 
+    counts = {}
+    for r in results:
+        for b in r["interestingBodies"]:
+            if b.get("codex"):
+                counts[(b["entryid"], b["subType"])] = counts.get((b["entryid"], b["subType"]), 0) + 1
+    if counts:
+        print("Codex entries matched in final target systems:")
+        for (entryid, name), n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {entryid:>8} {name}: {n:,} systems")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -459,6 +556,14 @@ def parse_args():
         help="Path to the Spansh galaxy.json.gz dump (not bundled - get it "
              "from https://downloads.spansh.co.uk/galaxy.json.gz).",
     )
+    parser.add_argument(
+        "--codex",
+        metavar="DIR",
+        help="Directory of Canonn codex dump files named {entryid}.csv (no "
+             "header; columns SystemName,x,y,z,entryid,id64,region1,region2). "
+             "Systems with Anomaly/Biology/Cloud/Tourist codex entries count "
+             "as interesting.",
+    )
     return parser.parse_args()
 
 
@@ -469,7 +574,7 @@ def main():
     print(f"Loaded {len(candidates)} candidate systems with Canonn / "
           f"Canonn Deep Space Research presence.")
 
-    anchors, interesting_pool = scan_galaxy(candidates, args.galaxy_file)
+    anchors, interesting_pool = scan_galaxy(candidates, args.galaxy_file, args.codex and os.path.expanduser(args.codex))
     join_and_write(anchors, interesting_pool)
 
 
