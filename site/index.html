@@ -20,41 +20,33 @@
     <img src="assets/canonn.svg" alt="" class="bgs-logo">
   </div>
 
-  <section class="filters" aria-label="Filters">
-    <div class="filter-row">
-      <div class="field">
-        <label for="search">Search</label>
-        <input type="text" id="search" placeholder="System or colonisation contact name…">
-      </div>
-      <div class="field">
-        <label for="home-system">Colonisation contact</label>
-        <select id="home-system">
-          <option value="">All</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="body-type">Interesting body type</label>
-        <select id="body-type">
-          <option value="">All</option>
-        </select>
+  <section class="system-search" aria-label="Sort by distance from system">
+    <div class="field system-search-field">
+      <label for="system-search">Sort by distance from system</label>
+      <div class="system-search-input-wrap">
+        <input type="text" id="system-search" value="Varati" placeholder="Enter a system name…" autocomplete="off" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="system-search-suggestions">
+        <ul id="system-search-suggestions" class="system-search-suggestions" role="listbox" hidden></ul>
       </div>
     </div>
+    <button id="system-search-go" type="button" class="bgs-filter-chip">Sort by distance</button>
+    <button id="system-search-clear" type="button" class="bgs-filter-chip" hidden>Clear</button>
+    <span id="system-search-error" class="system-search-error" role="alert" hidden></span>
+  </section>
+
+  <section class="filters" aria-label="Filters">
     <div class="filter-row">
       <div class="field">
         <label for="min-bodies">Min. body count</label>
         <input type="number" id="min-bodies" min="0" placeholder="0">
       </div>
       <div class="field">
-        <label for="max-distance">Max. distance to home (ly)</label>
-        <input type="number" id="max-distance" min="0" step="0.1" placeholder="15">
-      </div>
-      <div class="field">
         <label for="sort-by">Sort by</label>
         <select id="sort-by">
           <option value="bodyCount" selected>Body count</option>
-          <option value="distanceToHome">Distance to home</option>
+          <option value="distanceFromSearch">Distance from searched system</option>
           <option value="name">System name</option>
           <option value="homeSystem">Colonisation contact</option>
+          <option value="architect">Architect</option>
         </select>
       </div>
       <div class="field">
@@ -62,6 +54,14 @@
         <select id="sort-dir">
           <option value="desc" selected>Descending</option>
           <option value="asc">Ascending</option>
+        </select>
+      </div>
+    </div>
+    <div class="filter-row">
+      <div class="field">
+        <label for="body-type">Interesting body type</label>
+        <select id="body-type">
+          <option value="">All</option>
         </select>
       </div>
       <div class="field field-reset">
@@ -90,7 +90,8 @@
         <tr>
           <th class="sortable" data-sort="name">System<span class="sort-indicator"></span></th>
           <th class="sortable" data-sort="homeSystem">Colonisation contact<span class="sort-indicator"></span></th>
-          <th class="num sortable" data-sort="distanceToHome">Distance (ly)<span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort="architect">Architect<span class="sort-indicator"></span></th>
+          <th class="num sortable" data-sort="distanceFromSearch" id="distance-from-search-header">Dist. from search (ly)<span class="sort-indicator"></span></th>
           <th class="num sortable" data-sort="bodyCount">Bodies<span class="sort-indicator"></span></th>
           <th>Interesting bodies</th>
         </tr>
@@ -118,9 +119,11 @@
       <dt>Coordinates</dt><dd id="modal-coords"></dd>
       <dt>Body count</dt><dd id="modal-bodycount"></dd>
       <dt>Colonisation contact</dt><dd id="modal-home"></dd>
+      <dt>Architect</dt><dd id="modal-architect"></dd>
       <dt>Distance to home</dt><dd id="modal-distance"></dd>
+      <dt id="modal-distance-search-label" hidden>Distance from searched system</dt><dd id="modal-distance-search" hidden></dd>
     </dl>
-    <h3>Colonisation Contact Station</h3>
+    <h3>Canonn Colonisation Contact Station</h3>
     <ul id="modal-stations"></ul>
     <h3>Interesting bodies</h3>
     <ul id="modal-bodies"></ul>

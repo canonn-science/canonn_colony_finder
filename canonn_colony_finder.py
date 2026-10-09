@@ -46,22 +46,63 @@ RADIUS_LY = 15.0
 MIN_BODY_COUNT = 40
 GRID_SIZE = RADIUS_LY  # one grid cell = one radius, so a 1-cell neighborhood covers it
 
-RARE_STAR_MARKERS = (
-    "Black Hole",
-    "Neutron Star",
-    "Herbig",
-    "Wolf-Rayet",
-    "T Tauri",
-    "White Dwarf",
-)
-RARE_PLANET_TYPES = {
-    "Earth-like world",
+RARE_SUBTYPES = {
+    "High metal content world",
+    "Rocky body",
+    "K (Yellow-Orange) Star",
+    "Metal-rich body",
     "Water world",
+    "Gas giant with water-based life",
+    "Neutron Star",
+    "T Tauri Star",
+    "Gas giant with ammonia-based life",
     "Ammonia world",
+    "Earth-like world",
+    "Black Hole",
     "Water giant",
+    "Helium-rich gas giant",
+    "M (Red giant) Star",
+    "White Dwarf (DC) Star",
+    "Herbig Ae/Be Star",
+    "White Dwarf (DA) Star",
+    "White Dwarf (DAB) Star",
+    "K (Yellow-Orange giant) Star",
+    "Wolf-Rayet O Star",
+    "S-type Star",
+    "MS-type Star",
+    "White Dwarf (DB) Star",
+    "CN Star",
+    "A (Blue-White super giant) Star",
+    "White Dwarf (DCV) Star",
+    "B (Blue-White super giant) Star",
+    "White Dwarf (DAV) Star",
+    "Wolf-Rayet C Star",
+    "Wolf-Rayet N Star",
+    "Wolf-Rayet NC Star",
+    "F (White super giant) Star",
+    "G (White-Yellow super giant) Star",
+    "White Dwarf (DBV) Star",
+    "M (Red super giant) Star",
+    "CJ Star",
+    "White Dwarf (DAZ) Star",
+    "White Dwarf (DBZ) Star",
+    "C Star",
+    "Wolf-Rayet Star",
+    "White Dwarf (DQ) Star",
+    "Helium gas giant",
+    "White Dwarf (D) Star",
 }
 
-ID64_RE = re.compile(r'"id64":(\d+)')
+# Matched against raw bytes before the line is ever decoded - see scan_galaxy().
+# Spansh's dumps are minified (no space after a colon, confirmed against
+# factions.json.gz), so a single no-space pattern is enough.
+ID64_RE = re.compile(rb'"id64":(\d+)')
+POPULATION_ZERO = b'"population":0'
+# Cheap pre-parse coords extraction (see scan_galaxy()) - same minified-format
+# assumption as ID64_RE. Only used to bound-reject before a full json.loads;
+# a non-match always falls back to parsing the line, so it's never load-bearing
+# for correctness, only for speed.
+COORDS_RE = re.compile(rb'"coords":\{"x":(-?[0-9.]+),"y":(-?[0-9.]+),"z":(-?[0-9.]+)\}')
 
 
 # ---------------------------------------------------------------- step 1: candidates
@@ -101,14 +142,30 @@ def load_candidates():
 
 # ---------------------------------------------------------------- body classification
 
-def is_rare_star(sub_type):
-    return any(marker in sub_type for marker in RARE_STAR_MARKERS)
+GENUS_PREFIX = "$Codex_Ent_"
+GENUS_SUFFIX = "_Genus_Name;"
 
 
-def is_rare_planet(sub_type):
-    if sub_type in RARE_PLANET_TYPES:
-        return True
-    return "life" in sub_type.lower() and "gas giant" in sub_type.lower()
+def clean_genus_name(raw):
+    """"$Codex_Ent_Bacterial_Genus_Name;" -> "Bacterial"."""
+    name = raw or ""
+    if name.startswith(GENUS_PREFIX):
+        name = name[len(GENUS_PREFIX):]
+    if name.endswith(GENUS_SUFFIX):
+        name = name[: -len(GENUS_SUFFIX)]
+    return name
+
+
+def normalize_terraforming(raw):
+    """Spansh's free-text terraformingState, collapsed to one of four states."""
+    value = (raw or "").strip().lower()
+    if not value or value == "not terraformable":
+        return "not"
+    if "terraformed" in value:
+        return "terraformed"
+    if "terraforming" in value:
+        return "terraforming"
+    return "terraformable"  # e.g. "Terraformable" / "Candidate for terraforming"
 
 
 def interesting_bodies(bodies):
@@ -116,19 +173,30 @@ def interesting_bodies(bodies):
     for body in bodies:
         sub_type = body.get("subType") or ""
         body_type = body.get("type")
-        rare = False
-        if body_type == "Star" and is_rare_star(sub_type):
-            rare = True
-        elif body_type == "Planet" and is_rare_planet(sub_type):
-            rare = True
-        elif (
+        is_gas_giant = body_type == "Planet" and "gas giant" in sub_type.lower()
+        rare = sub_type in RARE_SUBTYPES or is_gas_giant
+        if not rare and (
             body.get("isLandable")
             and body.get("rings")
             and (body.get("atmosphereType") or "No atmosphere") != "No atmosphere"
         ):
             rare = True
         if rare:
-            found.append({"name": body.get("name"), "subType": sub_type})
+            found.append({
+                "name": body.get("name"),
+                "subType": sub_type,
+                "ringed": bool(body.get("rings")),
+                "terraform": normalize_terraforming(body.get("terraformingState")),
+            })
+
+        genuses = (body.get("signals") or {}).get("genuses") or []
+        for genus in genuses:
+            found.append({
+                "name": body.get("name"),
+                "subType": clean_genus_name(genus),
+                "ringed": False,
+                "terraform": "not",
+            })
     return found
 
 
@@ -189,7 +257,10 @@ def scan_galaxy(candidates, galaxy_file):
     start = time.time()
     scanned = 0
 
-    with gzip.open(galaxy_file, "rt", encoding="utf-8") as f:
+    # Binary mode: the cheap per-line checks below run against raw bytes, so the
+    # large majority of lines (ones we're about to reject) never pay UTF-8
+    # decoding cost. Only a line that passes those checks gets decoded.
+    with gzip.open(galaxy_file, "rb") as f:
         for line in f:
             scanned += 1
             if scanned % 500_000 == 0:
@@ -198,23 +269,35 @@ def scan_galaxy(candidates, galaxy_file):
                       f"{len(anchors)} anchors, {len(interesting_pool)} interesting candidates, "
                       f"{elapsed:.0f}s elapsed")
 
-            stripped = line.strip()
-            if stripped in ("[", "]", ""):
-                continue
-
             id_match = ID64_RE.search(line)
-            is_candidate = bool(id_match) and int(id_match.group(1)) in candidate_ids and \
-                int(id_match.group(1)) not in found_candidate_ids
+            line_id64 = int(id_match.group(1)) if id_match else None
+            is_candidate = line_id64 is not None and line_id64 in candidate_ids and \
+                line_id64 not in found_candidate_ids
 
-            population_hint = '"population":0' in line or '"population": 0' in line
             # Cheap reject: only fully parse lines that are either a station
             # candidate check, or that *might* pass the interesting-pool filter
-            # (unpopulated systems only - skip inhabited systems outright).
-            if not is_candidate and not population_hint:
+            # (unpopulated systems only - skip inhabited systems outright). The
+            # "[" / "]" array-boundary lines fall through here too, since they
+            # match neither, so there's no separate check needed for them.
+            if not is_candidate and POPULATION_ZERO not in line:
                 continue
 
+            if not is_candidate:
+                # json.loads parses the entire line - including a potentially
+                # large bodies array - regardless of which fields are read
+                # afterward, so it's worth avoiding entirely for a population-0
+                # system that's nowhere near any candidate. Pull coords straight
+                # out of the raw bytes and apply the same distance bound used
+                # later for the interesting pool, before paying for a full parse.
+                coords_match = COORDS_RE.search(line)
+                if coords_match:
+                    x, y, z = (float(v) for v in coords_match.groups())
+                    nearby_candidate, _ = nearest_in_grid(candidate_grid, x, y, z)
+                    if nearby_candidate is None:
+                        continue
+
             try:
-                system = json.loads(stripped.rstrip(","))
+                system = json.loads(line.decode("utf-8").rstrip(" \t\r\n,"))
             except json.JSONDecodeError:
                 continue
 
@@ -246,19 +329,23 @@ def scan_galaxy(candidates, galaxy_file):
             if "x" not in coords:
                 continue
 
+            # Bound memory, and skip the expensive per-body classification below:
+            # only keep going if this system is within range of *some* candidate.
+            # Most unpopulated systems in the galaxy are nowhere near a Canonn
+            # anchor, so rejecting those here - before interesting_bodies() loops
+            # every body - avoids that work for the vast majority of systems that
+            # reach this point. Confirmed-anchor filtering happens later, in
+            # join_and_write, since not every candidate turns out to control a
+            # station.
+            nearby_candidate, _ = nearest_in_grid(candidate_grid, coords["x"], coords["y"], coords["z"])
+            if nearby_candidate is None:
+                continue
+
             bodies = system.get("bodies") or []
             body_count = system.get("bodyCount") or len(bodies)
             rare_bodies = interesting_bodies(bodies)
 
             if body_count <= MIN_BODY_COUNT and not rare_bodies:
-                continue
-
-            # Bound memory: only keep it if it's within range of *some*
-            # candidate. Confirmed-anchor filtering happens later, in
-            # join_and_write, since not every candidate turns out to control
-            # a station.
-            nearby_candidate, _ = nearest_in_grid(candidate_grid, coords["x"], coords["y"], coords["z"])
-            if nearby_candidate is None:
                 continue
 
             interesting_pool.append({

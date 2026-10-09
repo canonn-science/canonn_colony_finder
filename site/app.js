@@ -2,6 +2,17 @@
   "use strict";
 
   const DATA_URL = "data/canonn_colony_targets.json";
+  const TYPEAHEAD_ENDPOINT = "https://us-central1-canonn-api-236217.cloudfunctions.net/query/typeahead";
+  const SUGGESTION_DEBOUNCE_MS = 300;
+  const SUGGESTION_MIN_LENGTH = 3;
+
+  /** Published Architect Registry sheet: tab-separated, header row first, "System Name" is the Colonisation Contact system. */
+  const ARCHITECTS_SHEET_URL =
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vS5TMBu2KJQBaNqSBropWVdXUcOjz-wJe57e8h4pRPzr7zZ066yjO-H2Z7hqZe-fOVSpzy-7dzAqU2z/pub?gid=1448295597&single=true&output=tsv";
+  const ARCHITECTS_SHEET_TIMEOUT_MS = 8000;
+
+  /** The system the "sort by distance" search box starts with — coordinates hardcoded to skip a lookup on launch. */
+  const DEFAULT_REFERENCE_SYSTEM = { name: "Varati", x: -178.65625, y: 77.125, z: -87.125 };
 
   const COPY_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
   const COPIED_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>`;
@@ -14,14 +25,26 @@
     filtered: [],
     page: 1,
     pageSize: 50,
+    referenceSystem: null, // { name, x, y, z }
+    suggestions: [],
+    activeSuggestionIndex: -1,
   };
 
+  /** name (lowercase) -> { name, x, y, z }, from the most recent typeahead responses. */
+  const typeaheadCache = new Map();
+
   const els = {
-    search: document.getElementById("search"),
-    homeSystem: document.getElementById("home-system"),
+    systemSearchInput: document.getElementById("system-search"),
+    systemSearchSuggestions: document.getElementById("system-search-suggestions"),
+    systemSearchGo: document.getElementById("system-search-go"),
+    systemSearchClear: document.getElementById("system-search-clear"),
+    systemSearchError: document.getElementById("system-search-error"),
+    distanceFromSearchHeader: document.getElementById("distance-from-search-header"),
+    modalDistanceSearchLabel: document.getElementById("modal-distance-search-label"),
+    modalDistanceSearch: document.getElementById("modal-distance-search"),
+    modalArchitect: document.getElementById("modal-architect"),
     bodyType: document.getElementById("body-type"),
     minBodies: document.getElementById("min-bodies"),
-    maxDistance: document.getElementById("max-distance"),
     sortBy: document.getElementById("sort-by"),
     sortDir: document.getElementById("sort-dir"),
     resetFilters: document.getElementById("reset-filters"),
@@ -54,11 +77,183 @@
     };
   }
 
+  function distance3D(a, b) {
+    return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
+  }
+
+  function computeDistanceFromSearch() {
+    if (!state.referenceSystem) {
+      for (const row of state.all) delete row.distanceFromSearch;
+      return;
+    }
+    for (const row of state.all) {
+      row.distanceFromSearch = row.coords ? distance3D(row.coords, state.referenceSystem) : null;
+    }
+  }
+
+  /**
+   * Parses the Architect Registry sheet: tab-separated, header row first, columns matched by
+   * name so a reordered/added column doesn't break this. "System Name" is the Colonisation
+   * Contact system this colony targets anchor off of. The sheet is a Google Form response log
+   * (append-only, oldest first), and the same system can appear more than once - a later row
+   * is a more recent answer, so it should win. Iterating top-to-bottom and overwriting the map
+   * entry each time gives exactly that: the last entry wins.
+   */
+  function parseArchitectsTsv(text) {
+    const map = new Map();
+    const lines = text.replace(/\r\n/g, "\n").split("\n").filter((line) => line.length > 0);
+    if (lines.length === 0) return map;
+
+    const header = lines[0].split("\t");
+    const systemNameIndex = header.indexOf("System Name");
+    const architectNameIndex = header.indexOf("Architect Name");
+    if (systemNameIndex === -1 || architectNameIndex === -1) return map;
+
+    for (let i = 1; i < lines.length; i++) {
+      const cells = lines[i].split("\t");
+      const systemName = cells[systemNameIndex]?.trim();
+      if (!systemName) continue;
+      map.set(systemName, cells[architectNameIndex]?.trim() ?? "");
+    }
+    return map;
+  }
+
+  async function fetchArchitectRegistry() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ARCHITECTS_SHEET_TIMEOUT_MS);
+    try {
+      const res = await fetch(ARCHITECTS_SHEET_URL, { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parseArchitectsTsv(await res.text());
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchTypeahead(query) {
+    const res = await fetch(`${TYPEAHEAD_ENDPOINT}?q=${encodeURIComponent(query)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  function hideSuggestions() {
+    state.suggestions = [];
+    state.activeSuggestionIndex = -1;
+    els.systemSearchSuggestions.innerHTML = "";
+    els.systemSearchSuggestions.hidden = true;
+    els.systemSearchInput.setAttribute("aria-expanded", "false");
+  }
+
+  function renderSuggestions() {
+    els.systemSearchSuggestions.innerHTML = "";
+    if (!state.suggestions.length) {
+      els.systemSearchSuggestions.hidden = true;
+      els.systemSearchInput.setAttribute("aria-expanded", "false");
+      return;
+    }
+    state.suggestions.forEach((name, i) => {
+      const li = document.createElement("li");
+      li.textContent = name;
+      li.role = "option";
+      if (i === state.activeSuggestionIndex) li.classList.add("active");
+      li.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        selectSystem(name);
+      });
+      els.systemSearchSuggestions.appendChild(li);
+    });
+    els.systemSearchSuggestions.hidden = false;
+    els.systemSearchInput.setAttribute("aria-expanded", "true");
+  }
+
+  const fetchSuggestions = debounce(async (query) => {
+    try {
+      const response = await fetchTypeahead(query);
+      for (const system of response.min_max || []) {
+        typeaheadCache.set(system.name.toLowerCase(), system);
+      }
+      state.suggestions = response.values || [];
+      state.activeSuggestionIndex = -1;
+      renderSuggestions();
+    } catch {
+      hideSuggestions();
+    }
+  }, SUGGESTION_DEBOUNCE_MS);
+
+  function onSystemSearchInput() {
+    const value = els.systemSearchInput.value.trim();
+    els.systemSearchError.hidden = true;
+    if (value.length < SUGGESTION_MIN_LENGTH) {
+      hideSuggestions();
+      return;
+    }
+    fetchSuggestions(value);
+  }
+
+  function selectSystem(name) {
+    els.systemSearchInput.value = name;
+    hideSuggestions();
+    void searchBySystemName(name);
+  }
+
+  async function searchBySystemName(name) {
+    els.systemSearchError.hidden = true;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    const cached = typeaheadCache.get(trimmed.toLowerCase());
+    if (cached) {
+      applyReferenceSystem(cached);
+      return;
+    }
+
+    try {
+      const response = await fetchTypeahead(trimmed);
+      const match = (response.min_max || []).find(
+        (s) => s.name.toLowerCase() === trimmed.toLowerCase()
+      );
+      if (!match) {
+        els.systemSearchError.textContent = `System "${trimmed}" not found.`;
+        els.systemSearchError.hidden = false;
+        return;
+      }
+      typeaheadCache.set(match.name.toLowerCase(), match);
+      applyReferenceSystem(match);
+    } catch {
+      els.systemSearchError.textContent = "Lookup failed. Try again.";
+      els.systemSearchError.hidden = false;
+    }
+  }
+
+  function applyReferenceSystem(system) {
+    state.referenceSystem = system;
+    els.systemSearchInput.value = system.name;
+    els.systemSearchClear.hidden = false;
+    els.distanceFromSearchHeader.hidden = false;
+    computeDistanceFromSearch();
+    els.sortBy.value = "distanceFromSearch";
+    els.sortDir.value = "asc";
+    applyFilters();
+  }
+
+  function clearReferenceSystem() {
+    state.referenceSystem = null;
+    els.systemSearchInput.value = "";
+    els.systemSearchClear.hidden = true;
+    els.distanceFromSearchHeader.hidden = true;
+    els.systemSearchError.hidden = true;
+    computeDistanceFromSearch();
+    if (els.sortBy.value === "distanceFromSearch") {
+      els.sortBy.value = "bodyCount";
+      els.sortDir.value = "desc";
+    }
+    hideSuggestions();
+    applyFilters();
+  }
+
   function populateDropdowns(data) {
-    const homeSystems = new Set();
     const bodyTypes = new Set();
     for (const row of data) {
-      if (row.homeSystem) homeSystems.add(row.homeSystem);
       for (const body of row.interestingBodies || []) {
         if (body.subType) bodyTypes.add(body.subType);
       }
@@ -74,31 +269,17 @@
       }
     };
 
-    addOptions(els.homeSystem, homeSystems);
     addOptions(els.bodyType, bodyTypes);
   }
 
   function applyFilters() {
-    const q = els.search.value.trim().toLowerCase();
-    const home = els.homeSystem.value;
     const bodyType = els.bodyType.value;
     const minBodies = els.minBodies.value ? Number(els.minBodies.value) : null;
-    const maxDistance = els.maxDistance.value ? Number(els.maxDistance.value) : null;
     const sortBy = els.sortBy.value;
     const sortDir = els.sortDir.value;
 
     let rows = state.all;
 
-    if (q) {
-      rows = rows.filter(
-        (r) =>
-          (r.name || "").toLowerCase().includes(q) ||
-          (r.homeSystem || "").toLowerCase().includes(q)
-      );
-    }
-    if (home) {
-      rows = rows.filter((r) => r.homeSystem === home);
-    }
     if (bodyType) {
       rows = rows.filter((r) =>
         (r.interestingBodies || []).some((b) => b.subType === bodyType)
@@ -106,9 +287,6 @@
     }
     if (minBodies !== null && !Number.isNaN(minBodies)) {
       rows = rows.filter((r) => (r.bodyCount || 0) >= minBodies);
-    }
-    if (maxDistance !== null && !Number.isNaN(maxDistance)) {
-      rows = rows.filter((r) => (r.distanceToHome || 0) <= maxDistance);
     }
 
     rows = rows.slice().sort((a, b) => {
@@ -158,18 +336,24 @@
       const tr = document.createElement("tr");
       tr.tabIndex = 0;
 
-      const bodiesHtml = (row.interestingBodies || [])
+      const bodyGroups = groupBodies(row.interestingBodies || []);
+      const bodiesHtml = bodyGroups
         .slice(0, 4)
-        .map((b) => `<span class="tag rare">${escapeHtml(b.subType)}</span>`)
+        .map(([label, count]) => `<span class="tag rare">${escapeHtml(label)}${count > 1 ? ` ${count}` : ""}</span>`)
         .join("");
-      const extra = (row.interestingBodies || []).length > 4
-        ? `<span class="tag">+${row.interestingBodies.length - 4} more</span>`
+      const extra = bodyGroups.length > 4
+        ? `<span class="tag">+${bodyGroups.length - 4} more</span>`
+        : "";
+
+      const distanceFromSearchHtml = state.referenceSystem
+        ? `<td data-label="Dist. from search" class="num">${formatNum(row.distanceFromSearch)}</td>`
         : "";
 
       tr.innerHTML = `
         <td data-label="System" class="system-name">${systemNameCellHtml(row.name)}</td>
         <td data-label="Colonisation contact" class="system-name">${systemNameCellHtml(row.homeSystem)}</td>
-        <td data-label="Distance" class="num">${formatNum(row.distanceToHome)}</td>
+        <td data-label="Architect">${escapeHtml(row.architect || "—")}</td>
+        ${distanceFromSearchHtml}
         <td data-label="Bodies" class="num">${row.bodyCount ?? ""}</td>
         <td data-label="Interesting bodies">${bodiesHtml}${extra}</td>
       `;
@@ -194,6 +378,31 @@
     els.prevPage.disabled = state.page <= 1;
     els.nextPage.disabled = state.page >= pages;
     els.lastPage.disabled = state.page >= pages;
+  }
+
+  const TERRAFORM_LABELS = {
+    terraformed: "Terraformed",
+    terraforming: "Terraforming",
+    terraformable: "Terraformable",
+  };
+
+  function bodyLabel(body) {
+    const parts = [];
+    if (body.ringed) parts.push("Ringed");
+    const terraformLabel = TERRAFORM_LABELS[body.terraform];
+    if (terraformLabel) parts.push(terraformLabel);
+    parts.push(body.subType);
+    return parts.join(" ");
+  }
+
+  /** Groups bodies by their composed label, returning [label, count] pairs in first-seen order. */
+  function groupBodies(bodies) {
+    const counts = new Map();
+    for (const body of bodies) {
+      const label = bodyLabel(body);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    return Array.from(counts.entries());
   }
 
   function formatNum(n) {
@@ -221,18 +430,21 @@
     return `https://inara.cz/elite/starsystem/?search=${encodeURIComponent(name)}`;
   }
 
-  function inaraLinkHtml(displayName, className, systemName) {
-    const safeName = escapeHtml(displayName || "");
-    const url = inaraUrl(systemName !== undefined ? systemName : displayName);
-    return `<a class="${className}" href="${url}" target="_blank" rel="noopener noreferrer">${safeName}</a>`;
-  }
-
   function systemNameHtml(systemName) {
     const name = escapeHtml(systemName || "");
     const signalsHref = signalsUrl(systemName || "");
     const ravenHref = ravenColonialUrl(systemName || "");
     const inaraHref = inaraUrl(systemName || "");
     return `<a class="system-link" href="${signalsHref}" target="_blank" rel="noopener noreferrer">${name}</a><a class="external-btn" href="${inaraHref}" target="_blank" rel="noopener noreferrer" title="Open in Inara" aria-label="Open in Inara">${INARA_ICON}</a><a class="external-btn" href="${ravenHref}" target="_blank" rel="noopener noreferrer" title="Open in Raven Colonial" aria-label="Open in Raven Colonial">${ROCKET_ICON}</a><button type="button" class="copy-btn" data-copy="${name}" title="Copy system name" aria-label="Copy system name">${COPY_ICON}</button>`;
+  }
+
+  /** Like systemNameHtml, but for the Colonisation Contact system in the modal: Inara is the main link, signals.canonn.tech becomes an icon button. */
+  function homeSystemModalHtml(systemName) {
+    const name = escapeHtml(systemName || "");
+    const signalsHref = signalsUrl(systemName || "");
+    const ravenHref = ravenColonialUrl(systemName || "");
+    const inaraHref = inaraUrl(systemName || "");
+    return `<a class="system-link" href="${inaraHref}" target="_blank" rel="noopener noreferrer">${name}</a><a class="external-btn" href="${signalsHref}" target="_blank" rel="noopener noreferrer" title="Open in signals.canonn.tech" aria-label="Open in signals.canonn.tech">${EXTERNAL_ICON}</a><a class="external-btn" href="${ravenHref}" target="_blank" rel="noopener noreferrer" title="Open in Raven Colonial" aria-label="Open in Raven Colonial">${ROCKET_ICON}</a><button type="button" class="copy-btn" data-copy="${name}" title="Copy system name" aria-label="Copy system name">${COPY_ICON}</button>`;
   }
 
   function systemNameCellHtml(systemName) {
@@ -278,13 +490,21 @@
       ? `${row.coords.x}, ${row.coords.y}, ${row.coords.z}`
       : "—";
     els.modalBodycount.textContent = row.bodyCount ?? "—";
-    els.modalHome.innerHTML = row.homeSystem ? systemNameHtml(row.homeSystem) : "—";
+    els.modalHome.innerHTML = row.homeSystem ? homeSystemModalHtml(row.homeSystem) : "—";
+    els.modalArchitect.textContent = row.architect || "—";
     els.modalDistance.textContent = row.distanceToHome !== undefined ? `${formatNum(row.distanceToHome)} ly` : "—";
+
+    const hasSearchDistance = state.referenceSystem && row.distanceFromSearch !== undefined;
+    els.modalDistanceSearchLabel.hidden = !hasSearchDistance;
+    els.modalDistanceSearch.hidden = !hasSearchDistance;
+    if (hasSearchDistance) {
+      els.modalDistanceSearch.textContent = `${formatNum(row.distanceFromSearch)} ly (from ${state.referenceSystem.name})`;
+    }
 
     els.modalStations.innerHTML = "";
     for (const station of row.homeStations || []) {
       const li = document.createElement("li");
-      li.innerHTML = inaraLinkHtml(station, "inara-link", row.homeSystem);
+      li.textContent = station;
       els.modalStations.appendChild(li);
     }
     if (!(row.homeStations || []).length) {
@@ -294,7 +514,7 @@
     els.modalBodies.innerHTML = "";
     for (const body of row.interestingBodies || []) {
       const li = document.createElement("li");
-      li.textContent = `${body.name} — ${body.subType}`;
+      li.textContent = `${body.name} — ${bodyLabel(body)}`;
       els.modalBodies.appendChild(li);
     }
     if (!(row.interestingBodies || []).length) {
@@ -309,22 +529,50 @@
   }
 
   function resetFilters() {
-    els.search.value = "";
-    els.homeSystem.value = "";
     els.bodyType.value = "";
     els.minBodies.value = "";
-    els.maxDistance.value = "";
     els.sortBy.value = "bodyCount";
     els.sortDir.value = "desc";
     applyFilters();
   }
 
   function wireEvents() {
-    els.search.addEventListener("input", debounce(applyFilters, 150));
-    els.homeSystem.addEventListener("change", applyFilters);
+    els.systemSearchInput.addEventListener("input", onSystemSearchInput);
+    els.systemSearchInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        if (!state.suggestions.length) return;
+        e.preventDefault();
+        state.activeSuggestionIndex = (state.activeSuggestionIndex + 1) % state.suggestions.length;
+        renderSuggestions();
+      } else if (e.key === "ArrowUp") {
+        if (!state.suggestions.length) return;
+        e.preventDefault();
+        state.activeSuggestionIndex =
+          (state.activeSuggestionIndex - 1 + state.suggestions.length) % state.suggestions.length;
+        renderSuggestions();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (state.activeSuggestionIndex >= 0 && state.suggestions[state.activeSuggestionIndex]) {
+          selectSystem(state.suggestions[state.activeSuggestionIndex]);
+        } else {
+          hideSuggestions();
+          void searchBySystemName(els.systemSearchInput.value);
+        }
+      } else if (e.key === "Escape") {
+        hideSuggestions();
+      }
+    });
+    els.systemSearchInput.addEventListener("blur", () => {
+      setTimeout(hideSuggestions, 100);
+    });
+    els.systemSearchGo.addEventListener("click", () => {
+      hideSuggestions();
+      void searchBySystemName(els.systemSearchInput.value);
+    });
+    els.systemSearchClear.addEventListener("click", clearReferenceSystem);
+
     els.bodyType.addEventListener("change", applyFilters);
     els.minBodies.addEventListener("input", debounce(applyFilters, 150));
-    els.maxDistance.addEventListener("input", debounce(applyFilters, 150));
     els.sortBy.addEventListener("change", applyFilters);
     els.sortDir.addEventListener("change", applyFilters);
     els.resetFilters.addEventListener("click", resetFilters);
@@ -373,12 +621,19 @@
   async function init() {
     wireEvents();
     try {
-      const res = await fetch(DATA_URL);
+      const [res, architectMap] = await Promise.all([
+        fetch(DATA_URL),
+        fetchArchitectRegistry().catch(() => new Map()),
+      ]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      for (const row of data) {
+        row.architect = architectMap.get(row.homeSystem) || "";
+      }
       state.all = data;
       populateDropdowns(data);
-      applyFilters();
+      typeaheadCache.set(DEFAULT_REFERENCE_SYSTEM.name.toLowerCase(), DEFAULT_REFERENCE_SYSTEM);
+      applyReferenceSystem(DEFAULT_REFERENCE_SYSTEM);
     } catch (err) {
       els.resultCount.textContent = `Failed to load data: ${err.message}`;
     }
